@@ -3,7 +3,7 @@
 #include "esp_wifi.h"
 #include "esp_now.h"
 
-const char* ssid = "techiesms";
+const char* ssid = "Wi-Fi Moderator";
 const char* password = "";
 
 WebServer server(80);
